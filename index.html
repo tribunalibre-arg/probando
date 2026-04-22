@@ -58,45 +58,59 @@ window.__supabase = null;  // se inicializa cuando cargue el SDK
 
 <script>
 // ═══════════════════════════════════════════════════════════
-// RSS CON IMÁGENES — usa rss2json.com como proxy CORS.
-// Funciona 100% desde GitHub Pages sin backend.
-// Gratuito: 500 req/día. Para más, registrá un api_key gratis
-// en https://rss2json.com y reemplazá RSS2JSON_KEY abajo.
+// RSS — Estrategia dual: rss2json (primario) + proxies CORS (fallback)
+//
+// FEEDS: Google News RSS filtrado por Argentina.
+//   → Sin bloqueos por IP, siempre fresco, sin necesidad de
+//     credenciales de cada medio.
+//
+// PROXY PRIMARIO: rss2json.com
+//   → Registrá gratis en https://rss2json.com para obtener
+//     tu API key (500 req/día gratis, sin key igual funciona
+//     pero con rate-limit más bajo).
+//   → Ventaja: devuelve JSON limpio con thumbnail ya extraído.
+//
+// FALLBACK: 3 proxies CORS + parsing XML propio
 // ═══════════════════════════════════════════════════════════
-window.RSS2JSON_KEY = '';
+window.RSS2JSON_KEY = '';  // ← pegá tu key de rss2json.com (opcional pero recomendado)
 
-// Feeds que SÍ aceptan proxies CORS gratuitos
+// Google News RSS — contenido deportivo argentino, sin bloqueos
 window.RSS_FEEDS = [
-  { name: 'Infobae Deportes', url: 'https://www.infobae.com/feeds/rss/deportes/' },
-  { name: 'TyC Sports',       url: 'https://www.tycsports.com/rss.xml' },
-  { name: 'Olé',              url: 'https://www.ole.com.ar/rss/news.xml' },
-  { name: 'La Nación Dep.',   url: 'https://www.lanacion.com.ar/arc/outboundfeeds/rss/categoria/deportes/' },
-  { name: 'Clarín Deportes',  url: 'https://www.clarin.com/rss/deportes/' },
+  { name: 'Deportes Argentina',  url: 'https://news.google.com/rss/search?q=deportes+argentina&hl=es-AR&gl=AR&ceid=AR:es' },
+  { name: 'Fútbol Argentino',    url: 'https://news.google.com/rss/search?q=fútbol+liga+profesional+argentina&hl=es-AR&gl=AR&ceid=AR:es' },
+  { name: 'Selección Argentina', url: 'https://news.google.com/rss/search?q=selección+argentina+fútbol&hl=es-AR&gl=AR&ceid=AR:es' },
+  { name: 'River y Boca',        url: 'https://news.google.com/rss/search?q=river+boca+superclásico&hl=es-AR&gl=AR&ceid=AR:es' },
+  { name: 'Rugby Los Pumas',     url: 'https://news.google.com/rss/search?q=pumas+rugby+argentina&hl=es-AR&gl=AR&ceid=AR:es' },
 ];
 
-// Extrae la primera imagen de HTML de contenido RSS
+// ── Helpers ─────────────────────────────────────────────────
+
 function extractImgFromHtml(html) {
   if (!html) return null;
   const m = html.match(/<img[^>]+src=["']([^"']+)["']/i);
   return m ? m[1] : null;
 }
 
+// Parser XML (usado por los fallback CORS)
 function parseRSSXml(xmlText, sourceName) {
   const xml     = new DOMParser().parseFromString(xmlText, 'text/xml');
   const entries = [...xml.querySelectorAll('item')];
   if (!entries.length) throw new Error('sin items en el XML');
-  return entries.slice(0, 10).map(item => {
-    const get = tag => item.querySelector(tag)?.textContent?.trim() || '';
+  return entries.slice(0, 15).map(item => {
+    const get  = tag => item.querySelector(tag)?.textContent?.trim() || '';
     const desc = get('description');
     const img  =
       item.querySelector('enclosure[type^="image"]')?.getAttribute('url') ||
-      item.querySelector('thumbnail')?.getAttribute('url') ||
-      item.querySelector('content')?.getAttribute('url') ||
-      extractImgFromHtml(desc) || null;
+      item.querySelector('thumbnail')?.getAttribute('url')               ||
+      item.querySelector('content')?.getAttribute('url')                 ||
+      // media:thumbnail / media:content (namespace)
+      [...item.children].find(n => n.localName === 'thumbnail')?.getAttribute('url') ||
+      [...item.children].find(n => n.localName === 'content' && n.getAttribute('medium') === 'image')?.getAttribute('url') ||
+      extractImgFromHtml(get('content:encoded') || desc) || null;
     return {
       _id:         get('guid') || get('link'),
       title:       get('title'),
-      excerpt:     desc.replace(/<[^>]+>/g,'').replace(/&[a-z]+;/gi,' ').trim().slice(0,200),
+      excerpt:     desc.replace(/<[^>]+>/g,'').replace(/&[a-z#0-9]+;/gi,' ').trim().slice(0, 220),
       publishedAt: get('pubDate') || new Date().toISOString(),
       coverImage:  img,
       cat:         get('category') || 'Deportes',
@@ -106,20 +120,60 @@ function parseRSSXml(xmlText, sourceName) {
   });
 }
 
-// fetchRSSFeed — tres proxies CORS gratuitos en cascada, sin rss2json
+// Parser JSON de rss2json (thumbnail ya viene resuelto)
+function parseRss2Json(data, sourceName) {
+  if (data.status !== 'ok' || !Array.isArray(data.items))
+    throw new Error('rss2json: respuesta inválida — ' + data.message);
+  return data.items.slice(0, 15).map(item => ({
+    _id:         item.guid || item.link,
+    title:       item.title,
+    excerpt:     (item.description || '').replace(/<[^>]+>/g,'').replace(/&[a-z#0-9]+;/gi,' ').trim().slice(0, 220),
+    publishedAt: item.pubDate || new Date().toISOString(),
+    coverImage:  item.thumbnail || extractImgFromHtml(item.content || item.description) || null,
+    cat:         (item.categories && item.categories[0]) || 'Deportes',
+    category:    (item.categories && item.categories[0]) || 'Deportes',
+    meta:        { sourceName, sourceUrl: item.link || '#' }
+  }));
+}
+
+// ── fetchRSSFeed ─────────────────────────────────────────────
 window.fetchRSSFeed = async function(feedUrl, sourceName) {
   const CACHE_TTL = 15 * 60 * 1000;
-  const cacheKey  = 'tl_rss_' + sourceName.replace(/\W/g,'_');
+  const cacheKey  = 'tl_rss_' + sourceName.replace(/\W/g, '_');
+
+  // Helpers internos
+  const abort = ms => { const c = new AbortController(); setTimeout(() => c.abort(), ms); return c.signal; };
+  const save  = items => { try { localStorage.setItem(cacheKey, JSON.stringify({ data: items, ts: Date.now() })); } catch(e) {} };
+  const stale = () => { try { const r = localStorage.getItem(cacheKey); if (r) { const { data } = JSON.parse(r); if (Array.isArray(data) && data.length) return data; } } catch(e) {} return []; };
+
+  // 1 ▸ Caché válido
   try {
     const raw = localStorage.getItem(cacheKey);
     if (raw) {
       const { data, ts } = JSON.parse(raw);
       if (Date.now() - ts < CACHE_TTL && Array.isArray(data) && data.length > 0) {
-        console.log(`RSS [${sourceName}] desde caché (${data.length} items)`);
+        console.log(`RSS [${sourceName}] caché ✓ (${data.length} items)`);
         return data;
       }
     }
   } catch(e) {}
+
+  // 2 ▸ rss2json — primario (JSON, thumbnail resuelto automáticamente)
+  try {
+    const key    = window.RSS2JSON_KEY || '';
+    const apiUrl = `https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(feedUrl)}&count=20${key ? '&api_key=' + key : ''}`;
+    const resp   = await fetch(apiUrl, { signal: abort(10000) });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const json  = await resp.json();
+    const items = parseRss2Json(json, sourceName);
+    save(items);
+    console.log(`RSS [${sourceName}] rss2json ✓ (${items.length} items)`);
+    return items;
+  } catch(e) {
+    console.warn(`RSS [${sourceName}] rss2json ✗: ${e.message}`);
+  }
+
+  // 3 ▸ Proxies CORS + parsing XML (fallback)
   const proxies = [
     url => `https://corsproxy.io/?${encodeURIComponent(url)}`,
     url => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
@@ -127,23 +181,21 @@ window.fetchRSSFeed = async function(feedUrl, sourceName) {
   ];
   for (let i = 0; i < proxies.length; i++) {
     try {
-      const ctrl = new AbortController();
-      const tId  = setTimeout(() => ctrl.abort(), 9000);
-      const resp = await fetch(proxies[i](feedUrl), { signal: ctrl.signal }).finally(() => clearTimeout(tId));
+      const resp = await fetch(proxies[i](feedUrl), { signal: abort(10000) });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const items = parseRSSXml(await resp.text(), sourceName);
-      try { localStorage.setItem(cacheKey, JSON.stringify({ data: items, ts: Date.now() })); } catch(e) {}
-      console.log(`RSS [${sourceName}] cargado: ${items.length} noticias (proxy ${i+1})`);
+      save(items);
+      console.log(`RSS [${sourceName}] proxy ${i + 1} ✓ (${items.length} items)`);
       return items;
     } catch(e) {
-      console.warn(`RSS [${sourceName}] proxy ${i+1} falló: ${e.message}`);
+      console.warn(`RSS [${sourceName}] proxy ${i + 1} ✗: ${e.message}`);
     }
   }
-  try {
-    const raw = localStorage.getItem(cacheKey);
-    if (raw) { const { data } = JSON.parse(raw); if (Array.isArray(data) && data.length > 0) return data; }
-  } catch(e) {}
-  return [];
+
+  // 4 ▸ Caché vencida — último recurso
+  const staleData = stale();
+  if (staleData.length) console.warn(`RSS [${sourceName}] usando caché vencida (${staleData.length} items)`);
+  return staleData;
 };
 </script>
 
