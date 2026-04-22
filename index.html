@@ -31,7 +31,7 @@ window.__supabase = null;  // se inicializa cuando cargue el SDK
     return;
   }
   var s = document.createElement('script');
-  s.src = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js';
+  s.src = 'https://unpkg.com/@supabase/supabase-js@2/dist/umd/supabase.min.js';
   s.onload = function() {
     try {
       window.__supabase = window.supabase.createClient(window.SUPABASE_URL, window.SUPABASE_ANON);
@@ -51,7 +51,14 @@ window.__supabase = null;  // se inicializa cuando cargue el SDK
       console.warn('Supabase no disponible:', e.message);
     }
   };
-  s.onerror = function() { console.warn('Supabase SDK no cargó'); };
+  s.onerror = function() {
+    console.warn('Supabase SDK no cargó (unpkg). Reintentando con jsdelivr...');
+    var s2 = document.createElement('script');
+    s2.src = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js';
+    s2.onload = s.onload;
+    s2.onerror = function() { console.warn('Supabase SDK no disponible — modo sin autenticación.'); };
+    document.head.appendChild(s2);
+  };
   document.head.appendChild(s);
 })();
 </script>
@@ -73,6 +80,57 @@ window.__supabase = null;  // se inicializa cuando cargue el SDK
 // FALLBACK: 3 proxies CORS + parsing XML propio
 // ═══════════════════════════════════════════════════════════
 window.RSS2JSON_KEY = 'orknofcobjp0qossgdfetfjxwjehy22ndc910cfr';  // ← pegá tu key de rss2json.com (opcional pero recomendado)
+
+// ── GNews API — imágenes reales garantizadas ─────────────────────────────
+// Registrate GRATIS en https://gnews.io → Plan Free = 100 req/día
+// Devuelve el campo "image" directamente en cada artículo, sin proxies.
+window.GNEWS_KEY = '';  // ← pegá tu API key de gnews.io acá
+
+window.fetchGNews = async function() {
+  const key = window.GNEWS_KEY;
+  if (!key) return [];  // sin key, saltar silenciosamente
+
+  const CACHE_KEY = 'tl_gnews';
+  const CACHE_TTL = 15 * 60 * 1000;
+  try {
+    const raw = localStorage.getItem(CACHE_KEY);
+    if (raw) {
+      const { data, ts } = JSON.parse(raw);
+      if (Date.now() - ts < CACHE_TTL && Array.isArray(data) && data.length)
+        return data;
+    }
+  } catch(e) {}
+
+  const abort = ms => { const c = new AbortController(); setTimeout(() => c.abort(), ms); return c.signal; };
+  const CAT_MAP = { sports: 'Deportes' };
+
+  try {
+    // GNews permite CORS desde el browser directamente
+    const url = `https://gnews.io/api/v4/search?q=deportes+Argentina&lang=es&country=ar&max=20&apikey=${key}`;
+    const resp = await fetch(url, { signal: abort(12000) });
+    if (!resp.ok) throw new Error(`GNews HTTP ${resp.status}`);
+    const json = await resp.json();
+    if (!Array.isArray(json.articles)) throw new Error('GNews: sin artículos');
+
+    const items = json.articles.map((a, i) => ({
+      _id:         'gn_' + i + '_' + (a.url || '').slice(-20),
+      title:       a.title || '',
+      excerpt:     (a.description || '').slice(0, 220),
+      publishedAt: a.publishedAt || new Date().toISOString(),
+      coverImage:  a.image || null,           // ← imagen real, siempre presente
+      cat:         'Deportes',
+      category:    'Deportes',
+      meta:        { sourceName: a.source?.name || 'GNews', sourceUrl: a.url || '#' }
+    })).filter(a => a.title);
+
+    try { localStorage.setItem(CACHE_KEY, JSON.stringify({ data: items, ts: Date.now() })); } catch(e) {}
+    console.log(`GNews ✓ (${items.length} artículos con imagen)`);
+    return items;
+  } catch(e) {
+    console.warn('GNews ✗:', e.message);
+    return [];
+  }
+};
 
 // Google News RSS — contenido deportivo argentino, sin bloqueos
 window.RSS_FEEDS = [
@@ -1022,13 +1080,20 @@ function useNews(page=1, cat='', search='') {
     const safe = (fn) => (...args) => { if (!unmounted) fn(...args); };
     setState(s => ({ ...s, loading: true }));
 
-    Promise.all(
-      (window.RSS_FEEDS || []).map(f =>
+    Promise.all([
+      // GNews primero (tiene imágenes reales)
+      (window.fetchGNews ? window.fetchGNews() : Promise.resolve([])),
+      // RSS feeds en paralelo
+      ...((window.RSS_FEEDS || []).map(f =>
         window.fetchRSSFeed(f.url, f.name).then(items => ({ name: f.name, count: items.length, items }))
-      )
-    ).then(results => {
+      ))
+    ]).then(([gnewsItems, ...results]) => {
       const feedStatus = results.map(r => ({ name: r.name, count: r.count }));
-      let allPosts = results.flatMap(r => r.items).sort((a,b) => new Date(b.publishedAt)-new Date(a.publishedAt));
+      const rssItems   = results.flatMap(r => r.items);
+      // Combinar: GNews (con imagen) + RSS, deduplicar por título similar
+      const gnewsTitles = new Set(gnewsItems.map(a => a.title.slice(0,40).toLowerCase()));
+      const dedupRss    = rssItems.filter(a => !gnewsTitles.has(a.title.slice(0,40).toLowerCase()));
+      let allPosts = [...gnewsItems, ...dedupRss].sort((a,b) => new Date(b.publishedAt)-new Date(a.publishedAt));
       if (cat)    allPosts = allPosts.filter(p => (p.cat||p.category||'').toLowerCase().includes(cat.toLowerCase()));
       if (search) allPosts = allPosts.filter(p => p.title.toLowerCase().includes(search.toLowerCase()) || (p.excerpt||'').toLowerCase().includes(search.toLowerCase()));
       const limit = 18;
@@ -1109,7 +1174,7 @@ function NewsCard({ post, onClick }) {
   return (
     <div className="nc" onClick={onClick}>
       <div className="nc-img big">
-        {showImg && <img src={post.coverImage} alt={post.title} loading="lazy" onError={()=>setImgFailed(true)}/>}
+        {showImg && <img src={post.coverImage} alt={post.title} onError={()=>setImgFailed(true)}/>}
         <div className="nc-em" style={{display:showImg?'none':'flex'}}>{em}</div>
         <div className="nc-cat"><span className="badge bc">{cat}</span></div>
       </div>
